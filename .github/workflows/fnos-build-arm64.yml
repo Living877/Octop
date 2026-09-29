@@ -1,0 +1,185 @@
+name: Build ARM64 fnOS FPK
+
+# 自动构建 ARM64 (aarch64) 版飞牛 fnOS 安装包（本地版 native .fpk）。
+#
+# 原理（与上游 amd64 构建的关键差异）：
+#   - octop 的 wheel 是纯 Python（py3-none-any），架构中立；
+#   - 真正架构相关的是 site-packages 里的编译扩展（octop-harness[all] 依赖树）。
+#   - 本工作流在【原生 aarch64 runner】上用 uv 安装依赖，crcmod / evdev 等
+#     没有 aarch64 预编译 wheel 的包会从源码就地编译成正确的 aarch64 .so；
+#   - fnpack 打包 CLI 只有 amd64 版，故在 amd64 runner 上做 .fpk 封包。
+#
+# 触发：手动 workflow_dispatch，或同步上游后自动触发，或 push 到 main 改动打包相关文件。
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'fnos/**'
+      - 'scripts/**'
+      - 'pyproject.toml'
+      - 'dashboard/**'
+      - '.github/workflows/fnos-build-arm64.yml'
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: build-arm64-fpk
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------- job 1
+  # 在原生 aarch64 runner 上构建 site-packages（含从源码编译的 aarch64 .so）
+  build-site-arm64:
+    runs-on: ubuntu-24.04-arm
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Read version
+        id: ver
+        run: |
+          VER=$(sed -nE 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' pyproject.toml | head -1)
+          if [ -z "$VER" ]; then echo "::error::version not found"; exit 1; fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: dashboard/package-lock.json
+
+      - name: Try download wheel from upstream release
+        id: wheel
+        run: |
+          set -euo pipefail
+          VER="${{ steps.ver.outputs.version }}"
+          mkdir -p dist
+          if curl -fsSL -o dist/octop.whl "https://github.com/TencentCloud/Octop/releases/download/v${VER}/octop-${VER}-py3-none-any.whl"; then
+            echo "source=release" >> "$GITHUB_OUTPUT"
+            echo "复用上游 v${VER} release wheel"
+          else
+            echo "source=build" >> "$GITHUB_OUTPUT"
+            echo "上游 release 无对应 wheel，改为源码构建"
+          fi
+
+      - name: Build wheel from source
+        if: steps.wheel.outputs.source == 'build'
+        run: |
+          set -e
+          cd dashboard
+          npm ci --prefer-offline --no-audit
+          NODE_ENV=production NODE_OPTIONS="--max-old-space-size=4096" npm run build
+          cd ..
+          python3 -m pip install --quiet build
+          python3 -m build --wheel
+          cp dist/octop-*.whl dist/octop.whl
+
+      - name: Install Octop core into site-packages (native aarch64)
+        timeout-minutes: 25
+        run: |
+          set -euo pipefail
+          mkdir -p fnos/native/app/site-packages
+          SP="fnos/native/app/site-packages"
+          python3 -m pip install --quiet uv
+          python3 -m uv pip install --target "$SP" --no-cache dist/octop.whl
+          # 与上游 amd64 一致：mcp / langchain-mcp-adapters 用固定版本替换
+          rm -rf "$SP/mcp" "$SP"/mcp-*.dist-info \
+                 "$SP/langchain_mcp_adapters" "$SP"/langchain_mcp_adapters-*.dist-info
+          mkdir -p /tmp/octop-pinned
+          python3 -m uv pip install --target /tmp/octop-pinned --no-cache \
+            "mcp==1.28.1" "langchain-mcp-adapters==0.3.0"
+          cp -r /tmp/octop-pinned/mcp "$SP/mcp"
+          cp -r /tmp/octop-pinned/langchain_mcp_adapters "$SP/langchain_mcp_adapters"
+          cp -r /tmp/octop-pinned/mcp-*.dist-info /tmp/octop-pinned/langchain_mcp_adapters-*.dist-info "$SP/" 2>/dev/null || true
+          cp dist/octop.whl "$SP/octop.whl"
+
+      - name: Verify all .so are aarch64
+        run: |
+          set -euo pipefail
+          SP="fnos/native/app/site-packages"
+          echo "site-packages 大小: $(du -sh "$SP" | cut -f1)"
+          echo ".so 总数: $(find "$SP" -name '*.so' | wc -l)"
+          BAD=0
+          while IFS= read -r f; do
+            if ! file "$f" | grep -q "ARM aarch64"; then
+              echo "非 aarch64: $f ($(file -b "$f"))"
+              BAD=1
+            fi
+          done < <(find "$SP" -name '*.so')
+          [ "$BAD" -eq 0 ] && echo "OK: 所有 .so 均为 aarch64"
+
+      - name: Upload site-packages artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: site-packages-arm64
+          path: fnos/native/app/site-packages
+          retention-days: 7
+
+  # ---------------------------------------------------------------- job 2
+  # 在 amd64 runner 上用 fnpack（仅 amd64）封包成 .fpk 并发布
+  package-native:
+    needs: build-site-arm64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Download site-packages artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: site-packages-arm64
+          path: fnos/native/app/site-packages
+
+      - name: Build native ARM64 FPK
+        env:
+          FPK_NAME_PREFIX: Octop-fnos
+        run: bash scripts/build-fpk.sh native
+
+      - name: Rename with arm64 marker
+        run: |
+          cd dist
+          for f in Octop-fnos-native-*.fpk; do
+            mv "$f" "${f%.fpk}-arm64.fpk"
+          done
+          ls -lh
+
+      - name: Upload ARM64 fpk artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Octop-fnos-native-arm64
+          path: dist/Octop-fnos-native-*-arm64.fpk
+          if-no-files-found: error
+
+      - name: Attach to rolling release fnos-arm64-latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="fnos-arm64-latest"
+          FPK="$(ls dist/Octop-fnos-native-*-arm64.fpk | head -1)"
+          VER="${{ needs.build-site-arm64.outputs.version }}"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在，更新附件"
+            gh release upload "$TAG" "$FPK" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            echo "创建滚动 Release $TAG"
+            gh release create "$TAG" "$FPK" --repo "$GITHUB_REPOSITORY" \
+              --title "Octop fnOS ARM64 (native) $VER" \
+              --notes "ARM64 (aarch64) 本地版安装包，从上游同步自动构建。安装：飞牛应用中心 → 设置 → 手动安装应用，选择本 .fpk。"
+          fi

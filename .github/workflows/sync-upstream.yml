@@ -1,0 +1,55 @@
+name: Sync Upstream
+
+# 自动同步上游 TencentCloud/Octop 的 main 到本 fork 的 main，
+# 同步有更新后自动触发 ARM64 安装包构建（fnos-build-arm64.yml）。
+
+on:
+  schedule:
+    - cron: '30 1 * * *'   # 每天 01:30 UTC（09:30 北京时间）
+  workflow_dispatch:       # 也可手动触发
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Sync upstream main into fork main
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/TencentCloud/Octop.git
+          git fetch upstream main
+          git checkout main
+          git reset --hard origin/main
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "already_up_to_date=true" >> "$GITHUB_ENV"
+            echo "上游无新提交，无需同步"
+          else
+            git merge --no-edit upstream/main -m "chore: sync upstream main"
+            git push origin main
+            echo "already_up_to_date=false" >> "$GITHUB_ENV"
+            echo "已同步上游 main 并推送"
+          fi
+
+      - name: Trigger ARM64 package build
+        if: env.already_up_to_date == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'fnos-build-arm64.yml',
+              ref: 'main',
+            })
